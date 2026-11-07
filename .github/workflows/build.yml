@@ -1,0 +1,123 @@
+name: Build PingLess APK
+
+on:
+  workflow_dispatch:
+    inputs:
+      v2rayng_tag:
+        description: "نسخه v2rayNG (خالی = آخرین نسخه)"
+        required: false
+        default: ""
+  push:
+    branches: [main, master]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      GH_TOKEN: ${{ github.token }}
+      NDK_VERSION: "29.0.14206865"
+    steps:
+      - name: Checkout PingLess
+        uses: actions/checkout@v4
+
+      - name: Resolve v2rayNG version
+        id: ver
+        run: |
+          TAG="${{ github.event.inputs.v2rayng_tag }}"
+          if [ -z "$TAG" ]; then
+            TAG=$(gh release view -R 2dust/v2rayNG --json tagName -q .tagName)
+          fi
+          echo "v2rayNG tag: $TAG"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+
+      - name: Clone v2rayNG with submodules
+        run: |
+          git clone --depth 1 --branch "${{ steps.ver.outputs.tag }}" https://github.com/2dust/v2rayNG.git upstream
+          cd upstream
+          git submodule update --init --recursive
+          git -C AndroidLibXrayLite fetch --tags --quiet || true
+
+      - name: Set up Java 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - name: Install Android NDK
+        run: |
+          SDKM="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+          yes | "$SDKM" --licenses > /dev/null || true
+          "$SDKM" --install "ndk;$NDK_VERSION" > /dev/null || true
+          if [ -d "$ANDROID_HOME/ndk/$NDK_VERSION" ]; then
+            echo "NDK_HOME=$ANDROID_HOME/ndk/$NDK_VERSION" >> "$GITHUB_ENV"
+          else
+            echo "Falling back to runner NDK: $ANDROID_NDK_LATEST_HOME"
+            echo "NDK_HOME=$ANDROID_NDK_LATEST_HOME" >> "$GITHUB_ENV"
+          fi
+
+      - name: Build hev-socks5-tunnel (native)
+        run: |
+          cd upstream
+          bash compile-hevtun.sh
+          mkdir -p V2rayNG/app/libs
+          cp -r libs/* V2rayNG/app/libs/
+
+      - name: Download Xray core (libv2ray.aar)
+        run: |
+          LIBTAG=$(git -C upstream/AndroidLibXrayLite describe --tags --abbrev=0)
+          echo "AndroidLibXrayLite tag: $LIBTAG"
+          gh release download "$LIBTAG" -R 2dust/AndroidLibXrayLite -p "libv2ray.aar" -D upstream/V2rayNG/app/libs --clobber
+          ls -la upstream/V2rayNG/app/libs
+
+      - name: Apply PingLess customizations
+        run: python3 scripts/apply_overlay.py upstream/V2rayNG/app
+
+      - name: Prepare signing key
+        env:
+          KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+        run: |
+          KS="$RUNNER_TEMP/pingless.jks"
+          if [ -n "$KEYSTORE_BASE64" ] && [ -n "$KEYSTORE_PASSWORD" ]; then
+            echo "$KEYSTORE_BASE64" | base64 -d > "$KS"
+            PASS="$KEYSTORE_PASSWORD"
+            echo "Using signing key from repository secrets."
+          else
+            PASS=$(openssl rand -hex 16)
+            keytool -genkeypair -keystore "$KS" -alias pingless -keyalg RSA -keysize 2048 -validity 36500 \
+              -storepass "$PASS" -keypass "$PASS" -dname "CN=PingLess" > /dev/null
+            echo "::warning::KEYSTORE_BASE64 / KEYSTORE_PASSWORD secrets are not set. A temporary key was used; users will have to uninstall before installing the next build."
+          fi
+          echo "::add-mask::$PASS"
+          echo "SIGN_PASS=$PASS" >> "$GITHUB_ENV"
+          echo "SIGN_FILE=$KS" >> "$GITHUB_ENV"
+
+      - name: Build APK
+        run: |
+          cd upstream/V2rayNG
+          chmod +x gradlew
+          SIGN="-Pandroid.injected.signing.store.file=$SIGN_FILE -Pandroid.injected.signing.store.password=$SIGN_PASS -Pandroid.injected.signing.key.alias=pingless -Pandroid.injected.signing.key.password=$SIGN_PASS"
+          if ./gradlew tasks --all --no-daemon -q 2>/dev/null | grep -q "^assembleFdroidRelease"; then
+            ./gradlew assembleFdroidRelease --no-daemon --stacktrace $SIGN
+          else
+            ./gradlew assembleRelease --no-daemon --stacktrace $SIGN
+          fi
+
+      - name: Collect APKs
+        run: |
+          mkdir -p out
+          find upstream/V2rayNG/app/build/outputs/apk -name "*.apk" | while read -r f; do
+            b=$(basename "$f")
+            b=${b/v2rayNG/PingLess}
+            cp "$f" "out/$b"
+          done
+          ls -la out
+          test -n "$(ls out/*.apk 2>/dev/null)"
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: PingLess-APK-${{ steps.ver.outputs.tag }}
+          path: out/*.apk
+          if-no-files-found: error
